@@ -1,4 +1,5 @@
-// freelist allocator
+// freelist allocator with coalescing (boundary tag)
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -10,6 +11,7 @@ typedef struct BlockHeader {
 } BlockHeader;
 
 #define HEADER_SIZE sizeof(BlockHeader)
+#define FOOTER_SIZE sizeof(size_t)
 #define MIN_BLOCK_SIZE 32
 
 typedef struct {
@@ -20,26 +22,6 @@ typedef struct {
 
 void print_free_list(Allocator *);
 void print_alloc_size(void *);
-
-int AllocatorInit(Allocator *allocator, size_t size) {
-  void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (region == MAP_FAILED) {
-    perror("mmap");
-    return 1;
-  }
-
-  allocator->base = region;
-  allocator->capacity = size;
-
-  BlockHeader *initial = (BlockHeader *)region;
-  initial->size = size - HEADER_SIZE;
-  initial->isFree = 1;
-  initial->next = NULL;
-  allocator->freelist = initial;
-
-  return 0;
-}
 
 static BlockHeader *find_first_fit(Allocator *allocator, size_t size,
                                    BlockHeader **prev_out) {
@@ -59,6 +41,76 @@ static BlockHeader *find_first_fit(Allocator *allocator, size_t size,
   return NULL;
 }
 
+static void write_footer(BlockHeader *block) {
+  size_t *footer = (size_t *)((char *)block + HEADER_SIZE + block->size);
+  *footer = block->size;
+}
+
+static BlockHeader *get_next_physical(Allocator *allocator,
+                                      BlockHeader *header) {
+  char *candidate = (char *)header + HEADER_SIZE + header->size + FOOTER_SIZE;
+  char *arena_end = (char *)allocator->base + allocator->capacity;
+  if (candidate >= arena_end)
+    return NULL;
+  return (BlockHeader *)candidate;
+}
+
+static BlockHeader *get_prev_physical(Allocator *allocator,
+                                      BlockHeader *header) {
+
+  // first block
+  if ((char *)header == (char *)allocator->base)
+    return NULL;
+
+  size_t *prev_footer = (size_t *)((char *)header - FOOTER_SIZE);
+  size_t prev_size = *prev_footer;
+  return (BlockHeader *)((char *)header - FOOTER_SIZE - prev_size -
+                         HEADER_SIZE);
+}
+
+static void freelist_remove(Allocator *allocator, BlockHeader *target) {
+  BlockHeader *prev = NULL;
+  BlockHeader *curr = allocator->freelist;
+  while (curr != NULL) {
+    if (curr == target) {
+
+      if (prev == NULL)
+        allocator->freelist = curr->next;
+      else
+        prev->next = curr->next;
+      return;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+}
+
+static void freelist_push(Allocator *allocator, BlockHeader *block) {
+  block->next = allocator->freelist;
+  allocator->freelist = block;
+}
+
+int AllocatorInit(Allocator *allocator, size_t size) {
+  void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (region == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+
+  allocator->base = region;
+  allocator->capacity = size;
+
+  BlockHeader *initial = (BlockHeader *)region;
+  initial->size = size - HEADER_SIZE - FOOTER_SIZE;
+  initial->isFree = 1;
+  initial->next = NULL;
+  write_footer(initial);
+  allocator->freelist = initial;
+
+  return 0;
+}
+
 void *Alloc(Allocator *allocator, size_t size) {
   if (size == 0)
     return NULL;
@@ -75,14 +127,16 @@ void *Alloc(Allocator *allocator, size_t size) {
 
   size_t leftover = found->size - size;
 
-  if (leftover >= HEADER_SIZE + MIN_BLOCK_SIZE) {
-    BlockHeader *remainder =
-        (BlockHeader *)((char *)found + HEADER_SIZE + size);
-    remainder->size = leftover - HEADER_SIZE;
-    remainder->isFree = 1;
-    remainder->next = allocator->freelist;
-    allocator->freelist = remainder;
+  if (leftover >= HEADER_SIZE + FOOTER_SIZE + MIN_BLOCK_SIZE) {
     found->size = size;
+    write_footer(found);
+
+    BlockHeader *remainder =
+        (BlockHeader *)((char *)found + HEADER_SIZE + FOOTER_SIZE + size);
+    remainder->size = leftover - HEADER_SIZE - FOOTER_SIZE;
+    remainder->isFree = 1;
+    write_footer(remainder);
+    freelist_push(allocator, remainder);
   }
 
   found->isFree = 0;
@@ -101,8 +155,26 @@ void Free(Allocator *allocator, void *ptr) {
     return;
   }
   header->isFree = 1;
-  header->next = allocator->freelist;
-  allocator->freelist = header;
+  write_footer(header);
+
+  // forward
+  BlockHeader *next = get_next_physical(allocator, header);
+  if (next != NULL && next->isFree) {
+    freelist_remove(allocator, next);
+    header->size += HEADER_SIZE + FOOTER_SIZE + next->size;
+    write_footer(header);
+  }
+
+  // backward
+  BlockHeader *prev = get_prev_physical(allocator, header);
+  if (prev != NULL && prev->isFree) {
+    freelist_remove(allocator, prev);
+    prev->size += HEADER_SIZE + FOOTER_SIZE + header->size;
+    write_footer(prev);
+    header = prev; // merged block is now the prev
+  }
+
+  freelist_push(allocator, header);
 }
 
 void Destroy(Allocator *allocator) {
@@ -118,7 +190,8 @@ int main(int argc, char *argv[]) {
   if (AllocatorInit(&a, 4096) != 0)
     return 1;
 
-  printf("arena: %zu bytes, header size: %zu bytes\n", a.capacity, HEADER_SIZE);
+  printf("arena: %zu bytes, header size: %zu, footer: %zu\n", a.capacity,
+         HEADER_SIZE, FOOTER_SIZE);
   print_free_list(&a);
 
   ///
@@ -150,39 +223,12 @@ int main(int argc, char *argv[]) {
 
   print_free_list(&a);
 
-  printf("freeing p2 --\n");
-  Free(&a, p2);
-  print_free_list(&a);
-
-  ///
-  char *p4 = Alloc(&a, 100);
-  if (!p4) {
-    fprintf(stderr, "p4 alloc failed\n");
-    return 1;
-  }
-  strcpy(p4, "reused p2 (i believe)");
-  printf("p4: %p, %s - p2: %p\n", (void *)p4, p4, (void *)p2);
-
-  print_free_list(&a);
+  printf("freeing p1, p2, p3 --\n");
   Free(&a, p1);
-  Free(&a, p2);
-  Free(&a, p3);
-  Free(&a, p4);
   print_free_list(&a);
-
-  int *nums = Alloc(&a, sizeof(int) * 20);
-  printf("nums: %p,  %ld\n", (void *)nums, sizeof(nums));
-  print_alloc_size(nums);
-
-  for (int i = 0; i < 10; i++) {
-    nums[i] = i + 1;
-  }
-
-  for (int i = 0; i < 10; i++) {
-    printf("%d ", nums[i]);
-  }
-  printf("\n");
-
+  Free(&a, p2);
+  print_free_list(&a);
+  Free(&a, p3);
   print_free_list(&a);
 
   Destroy(&a);
